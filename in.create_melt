@@ -1,0 +1,186 @@
+units         lj
+atom_style    full
+dimension     3
+
+boundary p p p
+
+neighbor 0.8 bin
+
+read_data star.data
+
+change_box all x delta -2.0 2.0 units box
+change_box all y delta -2.0 2.0 units box
+change_box all z delta -2.0 2.0 units box
+change_box all boundary f f f
+####################################
+####  GROUPS
+####################################
+
+group  core  type 1
+group  bead  type 2
+group  stars type 1 2
+
+####################################
+####  POTENTIALS
+####################################
+
+bond_style    harmonic
+bond_coeff    1 2500.0 0.9
+bond_coeff    2 2500.0 0.9
+special_bonds fene
+
+pair_style    soft 1.0
+pair_coeff    * * 0.0
+variable prefactor equal ramp(0,300)
+fix rampSoft all adapt 1 pair soft a * * v_prefactor
+
+####################################
+####  VARIABLES DEFINITION
+####################################
+
+variable Temp equal 1.0
+variable Temp2 equal 0.1
+variable PressAnn equal 10.0
+variable PressEq equal 0.0
+variable dt equal 0.005
+variable Tdamping equal 100*${dt}
+variable Pdamping equal 1000*${dt}
+variable runtime equal 4000000
+variable runtimeShort equal 100000
+
+variable Lbox equal 80.0
+variable thick1 equal 15.0
+variable thick2 equal 10.0
+
+variable thermoT equal 1000
+variable velSeed equal 934851
+
+####################################
+#### THERMO-STYLE
+####################################
+
+thermo  ${thermoT}
+
+compute	stressA all stress/atom NULL
+compute	p all reduce sum c_stressA[1] c_stressA[2] c_stressA[3]
+variable	pz equal -(c_p[3])/(vol)
+variable	pxy equal -(c_p[1]+c_p[2])/(2*vol)
+thermo_style	custom step temp ebond epair ke etotal enthalpy vol density press v_pxy v_pz
+
+####################################
+#### INTEGRATION
+####################################
+
+velocity     all create ${Temp} ${velSeed}
+timestep      ${dt}
+####################################
+#### RELAX SOFT
+####################################
+
+fix nvt1 all nvt temp ${Temp} ${Temp} ${Tdamping}
+fix wallsRelaxX all wall/lj93 xlo EDGE 1.0 1.0 1.12 xhi EDGE 1.0 1.0 1.12
+fix wallsRelaxY all wall/lj93 ylo EDGE 1.0 1.0 1.12 yhi EDGE 1.0 1.0 1.12
+fix wallsRelaxZ all wall/lj93 zlo EDGE 1.0 1.0 1.12 zhi EDGE 1.0 1.0 1.12
+fix_modify wallsRelaxX energy yes
+fix_modify wallsRelaxY energy yes
+fix_modify wallsRelaxZ energy yes
+
+reset_timestep 0
+run ${runtimeShort}
+
+write_data relaxed.data
+unfix wallsRelaxX
+unfix wallsRelaxY
+unfix wallsRelaxZ
+unfix rampSoft
+
+replicate 5 6 18
+change_box all boundary p p f
+
+####################################
+#### SQUEEZE BULK TO FILM
+####################################
+
+#change to repulsive LJ interactions
+pair_style lj/expand 1.12246 
+pair_coeff    * * 1.0 1.0  0.0   1.12246
+
+#fix z walls moving with the box 
+variable wallL equal ramp(zlo,zlo)
+variable wallH equal ramp(zhi,zhi)
+fix walls all wall/lj93 zlo v_wallL 1.0 1.0 2.5 zhi v_wallH 1.0 1.0 2.5
+fix_modify walls energy yes
+
+#squeeze the box to thin film
+fix shrink1 all deform 1 x final -${Lbox} ${Lbox} y final -${Lbox} ${Lbox} z final -${thick1} ${thick1}
+
+reset_timestep 0
+run ${runtime}
+
+write_data firstSqueeze.data
+
+#turn on attraction and squeeze more
+pair_coeff    * * 1.0 1.0  0.0   2.5
+unfix shrink1
+fix shrink2 all deform 1 z final -${thick2} ${thick2}
+
+reset_timestep 0
+run ${runtime}
+
+write_data startEqui.data
+unfix nvt1
+unfix shrink2
+
+####################################
+#### EQUILIBRATION
+####################################
+fix stabilize all momentum 1 linear 1 1 1
+reset_timestep 0
+
+fix npt1 all npt temp ${Temp} ${Temp} ${Tdamping} x ${PressAnn} ${PressAnn} ${Pdamping} y ${PressAnn} ${PressAnn} ${Pdamping} couple xy
+run ${runtime}
+unfix npt1
+
+fix npt2 all npt temp ${Temp} ${Temp2} ${Tdamping} x ${PressAnn} ${PressEq} ${Pdamping} y ${PressAnn} ${PressEq} ${Pdamping} couple xy
+run ${runtime}
+unfix npt2
+
+fix npt3 all npt temp ${Temp2} ${Temp2} ${Tdamping} x ${PressEq} ${PressEq} ${Pdamping} y ${PressEq} ${PressEq} ${Pdamping} couple xy 
+run ${runtimeShort}
+
+reset_timestep 0
+unfix walls
+change_box all boundary p p s
+
+restart 1000000 Conf_*.bin
+
+dump mydumpEqui stars custom 100000 Conf_*.dat id type xu yu zu vx vy vz
+dump_modify mydumpEqui sort id
+
+run ${runtimeShort}
+
+write_data startProduction.data
+write_restart startProduction.bin
+unfix npt3
+undump mydumpEqui
+
+####################################
+#### ELONGATION
+####################################
+
+reset_timestep 0
+fix nvt0 all nvt temp ${Temp2} ${Temp2} ${Tdamping}
+unfix stabilize
+
+variable    engStress equal "-pxx"
+variable    strain equal "step*0.000005"
+
+fix stressCurve all print 1 "${strain} ${engStress}" file stressCurve.dat screen no
+fix stretch all deform 1 x erate 0.001 units box
+
+dump mydumpTens all custom 50000 ConfTens_*.dat id type xu yu zu c_stressA[1] c_stressA[2] c_stressA[3]
+dump_modify mydumpTens sort id
+
+run 2500000
+
+write_data endDeform.data
